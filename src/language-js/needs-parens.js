@@ -224,40 +224,10 @@ function needsParens(path, options) {
       );
 
     case "Decorator":
-      if (key === "expression") {
-        if (isMemberExpression(node) && node.computed) {
-          return true;
-        }
-
-        let hasCallExpression = false;
-        let hasMemberExpression = false;
-        let current = node;
-        while (current) {
-          switch (current.type) {
-            case "MemberExpression":
-              hasMemberExpression = true;
-              current = current.object;
-              break;
-            case "CallExpression":
-              if (
-                /** @(x().y) */ hasMemberExpression ||
-                /** @(x().y()) */ hasCallExpression
-              ) {
-                return options.parser !== "typescript";
-              }
-              hasCallExpression = true;
-              current = current.callee;
-              break;
-            case "Identifier":
-              return false;
-            case "TaggedTemplateExpression":
-              // babel-parser cannot parse
-              //   @foo`bar`
-              return options.parser !== "typescript";
-            default:
-              return true;
-          }
-        }
+      if (
+        key === "expression" &&
+        !canDecoratorExpressionUnparenthesized(node)
+      ) {
         return true;
       }
       break;
@@ -284,6 +254,24 @@ function needsParens(path, options) {
         key === "left" &&
         (parent.operator === "in" || parent.operator === "instanceof") &&
         node.type === "UnaryExpression"
+      ) {
+        return true;
+      }
+      break;
+
+    case "VariableDeclarator":
+      // Legacy syntax
+      // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Invalid_for-in_initializer
+      // `for (var a = 1 in b);`
+      if (
+        key === "init" &&
+        path.match(
+          undefined,
+          undefined,
+          (node, key) =>
+            key === "declarations" && node.type === "VariableDeclaration",
+          (node, key) => key === "left" && node.type === "ForInStatement",
+        )
       ) {
         return true;
       }
@@ -957,6 +945,7 @@ function needsParens(path, options) {
           }
         }
       }
+
       return false;
 
     case "BindExpression":
@@ -1189,6 +1178,9 @@ Matches following cases:
 
 new (a?.b)();
 new (a?.())();
+
+(a?.b)``;
+(a?.())``;
 ```
 */
 /**
@@ -1196,18 +1188,76 @@ new (a?.())();
  * @returns {boolean}
  */
 function shouldAddParenthesesToChainElement(path) {
-  // Babel, this was implemented before #13735, can use `path.match` as estree does
-  const { node, parent, grandparent, key } = path;
   if (
-    (node.type === "OptionalMemberExpression" ||
-      node.type === "OptionalCallExpression") &&
-    ((key === "object" && parent.type === "MemberExpression") ||
-      (key === "callee" &&
-        (parent.type === "CallExpression" ||
-          parent.type === "NewExpression")) ||
-      (parent.type === "TSNonNullExpression" &&
-        grandparent.type === "MemberExpression" &&
-        grandparent.object === parent))
+    // ESTree
+    path.match(
+      undefined,
+      (node, name) => name === "expression" && node.type === "ChainExpression",
+      (node, name) =>
+        name === "tag" && node.type === "TaggedTemplateExpression",
+    ) ||
+    // Babel
+    path.match(
+      (node) =>
+        node.type === "OptionalCallExpression" ||
+        node.type === "OptionalMemberExpression",
+      (node, name) =>
+        name === "tag" && node.type === "TaggedTemplateExpression",
+    ) ||
+    // Babel-ts
+    // (a?.b)!``;
+    // (a?.b!)``;
+    path.match(
+      (node) =>
+        node.type === "OptionalCallExpression" ||
+        node.type === "OptionalMemberExpression",
+      (node, name) =>
+        name === "expression" && node.type === "TSNonNullExpression",
+      (node, name) =>
+        name === "tag" && node.type === "TaggedTemplateExpression",
+    ) ||
+    // case (a?.b)!``; in Typescript
+    path.match(
+      undefined,
+      (node, name) => name === "expression" && node.type === "ChainExpression",
+      (node, name) =>
+        name === "expression" && node.type === "TSNonNullExpression",
+      (node, name) =>
+        name === "tag" && node.type === "TaggedTemplateExpression",
+    ) ||
+    // case (a?.b!)``; in Typescript
+    path.match(
+      undefined,
+      (node, name) =>
+        name === "expression" && node.type === "TSNonNullExpression",
+      (node, name) => name === "expression" && node.type === "ChainExpression",
+      (node, name) =>
+        name === "tag" && node.type === "TaggedTemplateExpression",
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    path.match(
+      (node) =>
+        node.type === "OptionalMemberExpression" ||
+        node.type === "OptionalCallExpression",
+      (node, name) =>
+        (name === "object" && node.type === "MemberExpression") ||
+        (name === "callee" &&
+          (node.type === "CallExpression" || node.type === "NewExpression")),
+    ) ||
+    path.match(
+      (node) =>
+        node.type === "OptionalMemberExpression" ||
+        node.type === "OptionalCallExpression",
+      (node, name) =>
+        name === "expression" && node.type === "TSNonNullExpression",
+      (node, name) =>
+        (name === "object" && node.type === "MemberExpression") ||
+        (name === "callee" && node.type === "CallExpression"),
+    )
   ) {
     return true;
   }
@@ -1215,7 +1265,8 @@ function shouldAddParenthesesToChainElement(path) {
   // ESTree, same logic as babel
   if (
     path.match(
-      () => node.type === "CallExpression" || node.type === "MemberExpression",
+      (node) =>
+        node.type === "CallExpression" || node.type === "MemberExpression",
       (node, name) => name === "expression" && node.type === "ChainExpression",
     ) &&
     (path.match(
@@ -1234,7 +1285,9 @@ function shouldAddParenthesesToChainElement(path) {
         undefined,
         (node, name) =>
           name === "expression" && node.type === "TSNonNullExpression",
-        (node, name) => name === "object" && node.type === "MemberExpression",
+        (node, name) =>
+          (name === "object" && node.type === "MemberExpression") ||
+          (name === "callee" && node.type === "CallExpression"),
       ))
   ) {
     return true;
@@ -1244,11 +1297,14 @@ function shouldAddParenthesesToChainElement(path) {
   // Use this to align with babel
   if (
     path.match(
-      () => node.type === "CallExpression" || node.type === "MemberExpression",
+      (node) =>
+        node.type === "CallExpression" || node.type === "MemberExpression",
       (node, name) =>
         name === "expression" && node.type === "TSNonNullExpression",
       (node, name) => name === "expression" && node.type === "ChainExpression",
-      (node, name) => name === "object" && node.type === "MemberExpression",
+      (node, name) =>
+        (name === "object" && node.type === "MemberExpression") ||
+        (name === "callee" && node.type === "CallExpression"),
     )
   ) {
     return true;
@@ -1256,6 +1312,38 @@ function shouldAddParenthesesToChainElement(path) {
 
   // This function only handle cases above
   return false;
+}
+
+function isDecoratorMemberExpression(node) {
+  if (node.type === "Identifier") {
+    return true;
+  }
+
+  if (isMemberExpression(node)) {
+    return (
+      !node.computed &&
+      !node.optional &&
+      node.property.type === "Identifier" &&
+      isDecoratorMemberExpression(node.object)
+    );
+  }
+
+  return false;
+}
+
+// Based on babel implementation
+// https://github.com/nicolo-ribaudo/babel/blob/c4b88a4e5005364255f7e964fe324cf7bfdfb019/packages/babel-generator/src/node/index.ts#L111
+function canDecoratorExpressionUnparenthesized(node) {
+  if (node.type === "ChainExpression") {
+    node = node.expression;
+  }
+
+  return (
+    isDecoratorMemberExpression(node) ||
+    (isCallExpression(node) &&
+      !node.optional &&
+      isDecoratorMemberExpression(node.callee))
+  );
 }
 
 export default needsParens;
